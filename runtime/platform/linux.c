@@ -310,6 +310,7 @@ __asm__(".text\n"
         ".type plat_fiber_entry, @function\n"
         ".p2align 4\n"
         "plat_fiber_entry:\n"
+        "    andq $-16, %rsp\n"   // the first call must find rsp 16-byte aligned (SysV ABI), see plat_fiber_new
         "    movq %r13, %rdi\n"
         "    callq *%r12\n"
         "    ud2\n"
@@ -347,6 +348,10 @@ PlatFiber *plat_fiber_new(size_t stack, void (*fn)(void *arg), void *arg) {
     sp[6] = sp[7] = 0;         // rbx, rbp
     sp[8] = (uint64_t)(uintptr_t)plat_fiber_entry;
     sp[9] = 0;
+    // fiber_swap leaves rsp at top - 8 when it returns into plat_fiber_entry, so a plain call from there would enter
+    // fn with rsp 16-byte aligned, where the SysV ABI wants 8 mod 16 (as after a call from an aligned caller). glibc
+    // built for x86-64-v3 (CachyOS) then faults on its first aligned AVX spill (vmovdqa in vsnprintf, reached from
+    // kern_svc CreateThread -> plat_thread_new_ex -> snprintf). plat_fiber_entry realigns before the call.
     f->sp = sp;
     return f;
 }
