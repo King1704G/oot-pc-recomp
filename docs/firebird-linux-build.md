@@ -117,3 +117,8 @@ is rendered but its lighting is blown out (white terrain, magenta sky), the same
 describes: compute passes with 64-bit atomics are skipped, mesh draws are not replayed, bindless shadow lookups are
 stand-ins. The frame-rate dips are pipeline builds and shader translation on first sight; `pipeline-keys.bin` warms
 them on the next start.
+
+A third run ended after about 75 game seconds in the ranch with a GPU reset of the pinned card (`radv/amdgpu: The
+CS has been cancelled because the context is lost`, `vkQueueSubmit2` -4, exit 70; the kernel logged
+`amdgpu 0000:07:00.0: GPU reset(13) succeeded`). Two earlier runs of 120 and 150 game seconds finished with
+`boot: passed`. Not attributed yet; `RADV_DEBUG=hang` on a repeat is the next step.
