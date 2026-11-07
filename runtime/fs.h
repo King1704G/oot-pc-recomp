@@ -40,7 +40,9 @@ uint32_t romfs_entry_type(int *out, const char *path);
 uint32_t romfs_list(const char *path, int (*add)(const char *name, int kind, uint64_t size, void *ctx), void *ctx);
 uint64_t romfs_file_count(void);                           // files in the index (fs_init first)
 const char *romfs_entry(uint64_t i, uint64_t *offset, uint64_t *size);   // path, image offset and size of index row i
-const char *romfs_image_path(void);                        // the romfs.bin path fs_init opened
+int romfs_entry_aux(uint64_t i);                           // 1 when row i's bytes are in the aux image, not the main one
+const char *romfs_image_path(void);                        // the romfs.bin (or .nup) path fs_init opened
+const char *romfs_aux_path(void);                          // the aux image path fs_init opened, NULL without one
 size_t romfs_overlay_count(void);
 int romfs_xbox_prompts_ready(void);                        // romfs-patches-xbox was there at start
 int romfs_xbox_prompts_active(void);                       // and was loaded (pad_layout = xbox_prompts at start)

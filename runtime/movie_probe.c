@@ -271,7 +271,7 @@ int probe_movie(void) {
     const char *dir = rt_config()->romfs;
     char image[PLAT_PATH_MAX];
     snprintf(image, sizeof image, "%s/romfs.bin", dir);
-    if (!plat_file_exists(image)) {
+    if (!plat_file_exists(image) && !plat_file_exists(dir)) {   // dir itself may be the image (a .nup indexed in place)
         printf("probe-movie: skipped: no RomFS image at %s (game data absent; extract it with tools/extract.py)\n", image);
         return 0;
     }

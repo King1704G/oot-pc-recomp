@@ -6,4 +6,5 @@
 
 void romfs_cache_init(PlatFile *image, uint64_t file_count);   // once, after the image opened
 PlatFile *romfs_cache_open(uint64_t i, uint64_t size);         // file i's copy (size bytes), or NULL
-void romfs_cache_note(uint64_t i, uint64_t off, uint64_t size);   // the game read file i (image range): copy it
+void romfs_cache_note(uint64_t i, PlatFile *from, uint64_t off, uint64_t size);   // the game read file i (a range of
+                                                                                  // the main or the aux image): copy it

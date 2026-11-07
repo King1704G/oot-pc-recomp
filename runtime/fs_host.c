@@ -1322,8 +1322,11 @@ static uint64_t probe_romfs(void) {
     CHECK(RES(S_MOUNT_ROM, U("../x"), 0, 0) == FS_R_INVALID, "MountRom with a bad name");
     probe_paths();
 
-    PlatFile *image = plat_file_open(romfs_image_path());
-    if (!image) rt_fatal("probe-fs: cannot open the RomFS image");
+    PlatFile *main_image = plat_file_open(romfs_image_path());
+    if (!main_image) rt_fatal("probe-fs: cannot open the RomFS image");
+    PlatFile *aux_image = romfs_aux_path() ? plat_file_open(romfs_aux_path()) : NULL;
+    if (romfs_aux_path() && !aux_image) rt_fatal("probe-fs: cannot open the RomFS aux image");
+    PlatFile *image = main_image;   // per sampled file below: the image its index row points into
     uint8_t *a = malloc(HEAD_BYTES), *b = malloc(HEAD_BYTES);
     need(a && b, "probe buffers");
     uint64_t step = count / SAMPLES, bytes = 0, sampled = 0, deep = 0, high = 0, largest = 0, lsize = 0;
@@ -1335,6 +1338,7 @@ static uint64_t probe_romfs(void) {
         int64_t fsize = -1;
         int type = -1;
         const char *name = romfs_entry(i, &off, &size);
+        image = romfs_entry_aux(i) ? aux_image : main_image;
         snprintf(path, sizeof path, "rom:/%s", name);
         if (!*sample && strchr(name, '/') && size >= 256) snprintf(sample, sizeof sample, "%s", name);
         int ok = RES(S_ENTRY_TYPE, U(&type), U(path)) == 0 && type == FS_ENTRY_FILE;
@@ -1368,6 +1372,7 @@ static uint64_t probe_romfs(void) {
     need(*sample, "no sampled file in a folder");
     uint64_t si = 0;
     while (strcmp(romfs_entry(si, &off, &size), sample)) si++;
+    image = romfs_entry_aux(si) ? aux_image : main_image;
     int same = 1;
     for (int slashes = 1; slashes <= 3; slashes++) {
         snprintf(path, sizeof path, "rom:%.*s%s", slashes, "///", sample);

@@ -11,6 +11,12 @@
 // Reads are positional (platform.h plat_file_pread), so threads read the image in parallel without a file-pointer
 // lock. TOTK_ROMFS_MMAP=1 maps the image instead.
 //
+// Indexed in place (tools/nup_romfs_index.py): the image may be the player's .nup container itself (TOTK_ROMFS names
+// the file, or <romfs>/romfs.bin is a link to it), with the raw files read at their extent offsets inside it, and the
+// files the container stores compressed decompressed once into a second image, romfs-aux.bin next to the main image
+// (TOTK_ROMFS_AUX overrides, else romfs-aux.bin next to romfs-index.bin). The index is then TOTKRFS2 and a row whose
+// offset has AUX_FLAG set lies in the aux image. ROMFS_AUX_SIZE / ROMFS_AUX_SHA256 (romfs_config.h) describe it.
+//
 // Overlays: files listed in a directory's manifest.tsv are served in place of the originals. Each line names a RomFS
 // path, the overlay's size and SHA-256 and the original's SHA-256 ("-" adds a file the RomFS lacks; it is numbered
 // after the RomFS's own files, file_count + k in path order). The directories, in this order: TOTK_ROMFS_PATCHES and
@@ -25,6 +31,10 @@
 #include "fs.h"
 #include "host.h"
 #include "romfs_config.h"
+#ifndef ROMFS_AUX_SIZE   // a romfs_config.h from before the aux image: no aux rows
+#define ROMFS_AUX_SIZE 0ull
+#define ROMFS_AUX_SHA256 ""
+#endif
 #include "romfs_cache.h"
 #include "romfs_path.h"
 #include "platform/platform.h"
@@ -34,6 +44,7 @@
 #define READ_CHUNK (64u << 20)       // largest single read
 #define HASH_CHUNK (8u << 20)
 #define ADDED UINT64_MAX             // an added overlay file's index until overlay_init numbers it
+#define AUX_FLAG (1ull << 63)        // on a row's offset: the bytes lie in the aux image (TOTKRFS2)
 
 typedef struct { uint64_t offset, size; uint32_t name, len; } Entry;
 _Static_assert(sizeof(Entry) == 24, "index entry layout");
@@ -45,8 +56,10 @@ static uint8_t *index_bytes;
 static size_t index_size;
 static uint64_t file_count, strings_offset;
 static PlatFile *image;
+static PlatFile *aux;                // the aux image, when the index has AUX_FLAG rows
 static const uint8_t *image_map;
 static char image_file[2048];
+static char aux_file[2048];
 static char index_dir[2048];         // the directory of romfs-index.bin: the proof file's default place
 static char mount_name[32];
 // Further names the application's RomFS is mounted under. Every MountRom mounts the same image (the application's own), so a
@@ -84,6 +97,12 @@ static Entry entry(uint64_t i) {
     return e;
 }
 static const char *entry_name(Entry e) { return (const char *)index_bytes + strings_offset + e.name; }
+
+// The file a row's bytes are in and their offset there: the main image, or the aux image for an AUX_FLAG row.
+static PlatFile *source(Entry e, uint64_t *offset) {
+    *offset = e.offset & ~AUX_FLAG;
+    return e.offset & AUX_FLAG ? aux : image;
+}
 
 static double now_s(void) { return (double)plat_now_ns() / 1e9; }
 
@@ -156,8 +175,19 @@ typedef struct { char magic[16], sha256[65]; uint8_t pad[7]; Identity id; } Romf
 static void verify_image(const char *dir) {
     const char *mode = cfg_get("TOTK_ROMFS_VERIFY");
     if (!mode || (strcmp(mode, "full") && strcmp(mode, "force"))) return;
+    if (!*ROMFS_IMAGE_SHA256)
+        rt_fatal("RomFS: TOTK_ROMFS_VERIFY=%s, but the index was built without hashing the image (tools/nup_romfs_index.py "
+                 "--no-hash); rebuild without it", mode);
     const char *pdir = cfg_get("TOTK_ROMFS_PROOF_DIR");
     if (pdir && *pdir) dir = pdir;
+    if (aux) {   // small (the compressed files of the container, decompressed once): hashed every time
+        char ahex[65];
+        rt_log("RomFS: verifying the SHA-256 of %s (%llu bytes)", aux_file, (unsigned long long)ROMFS_AUX_SIZE);
+        sha_range(aux, 0, ROMFS_AUX_SIZE, ahex, 1);
+        if (strcmp(ahex, ROMFS_AUX_SHA256))
+            rt_fatal("RomFS aux image %s has SHA-256 %s, the index recorded %s (run tools/nup_romfs_index.py again)",
+                     aux_file, ahex, ROMFS_AUX_SHA256);
+    }
     RomfsProof want = {0}, saved;
     memcpy(want.magic, "TOTKRFS-PROOF-1", 16);
     memcpy(want.sha256, ROMFS_IMAGE_SHA256, sizeof ROMFS_IMAGE_SHA256 < 65 ? sizeof ROMFS_IMAGE_SHA256 : 65);
@@ -271,7 +301,9 @@ static int overlay_load(const char *dir, int optional) {
         Entry e = {0};
         if (known) {
             e = entry(i);
-            sha_range(image, e.offset, e.size, hex, 0);
+            uint64_t off;
+            PlatFile *src = source(e, &off);
+            sha_range(src, off, e.size, hex, 0);
             if (strcmp(hex, orig)) BAD("RomFS overlay: the original of %s has SHA-256 %s, %s/manifest.tsv says %s",
                                        name, hex, dir, orig);
         } else {
@@ -364,8 +396,10 @@ static void heapdef_overlay(void) {
     Overlay *base = NULL;
     for (size_t k = 0; k < noverlay; k++)
         if (overlays[k].index == i) base = &overlays[k];
-    PlatFile *f = base ? open_read(base->path) : image;
-    uint64_t off = base ? 0 : entry(i).offset, n = base ? base->size : entry(i).size;
+    uint64_t src_off;
+    PlatFile *src = source(entry(i), &src_off);
+    PlatFile *f = base ? open_read(base->path) : src;
+    uint64_t off = base ? 0 : src_off, n = base ? base->size : entry(i).size;
     void *in = n && n < (16u << 20) && f ? malloc((size_t)n) : NULL;
     int ok = in && read_at(f, in, (uint32_t)n, off) == (int64_t)n;
     if (base && f) plat_file_close(f);
@@ -504,15 +538,20 @@ static void load_index(void) {
     if (strcmp(hex, ROMFS_INDEX_SHA256))
         rt_fatal("RomFS index %s has SHA-256 %s, this build expects %s (rebuild with tools/build_game.py)", path, hex,
                  ROMFS_INDEX_SHA256);
-    need(!memcmp(index_bytes, "TOTKRFS1", 8), "index format");
+    int has_aux = !memcmp(index_bytes, "TOTKRFS2", 8);
+    need(has_aux || !memcmp(index_bytes, "TOTKRFS1", 8), "index format");
     memcpy(&file_count, index_bytes + 8, 8);
     memcpy(&strings_offset, index_bytes + 16, 8);
     need(file_count == ROMFS_FILE_COUNT && file_count < 1000000 && strings_offset == 24 + file_count * 24 &&
          strings_offset < index_size, "index layout");
     const char *previous = NULL;
+    uint64_t aux_rows = 0;
     for (uint64_t i = 0; i < file_count; i++) {
         Entry e = entry(i);
-        need(e.offset <= ROMFS_IMAGE_SIZE && e.size <= ROMFS_IMAGE_SIZE - e.offset, "file bounds");
+        uint64_t off = e.offset & ~AUX_FLAG, limit = e.offset & AUX_FLAG ? ROMFS_AUX_SIZE : ROMFS_IMAGE_SIZE;
+        need(has_aux || !(e.offset & AUX_FLAG), "aux row in a TOTKRFS1 index");
+        need(off <= limit && e.size <= limit - off, "file bounds");
+        aux_rows += (e.offset & AUX_FLAG) != 0;
         need(e.name < index_size - strings_offset && e.len > 1 && e.len <= index_size - strings_offset - e.name,
              "name bounds");
         const char *name = entry_name(e);
@@ -520,7 +559,37 @@ static void load_index(void) {
              "sorted paths");
         previous = name;
     }
-    rt_log("RomFS index %s: SHA-256 ok, %llu files, %zu bytes", path, (unsigned long long)file_count, index_size);
+    need(!aux_rows == !ROMFS_AUX_SIZE, "aux rows and ROMFS_AUX_SIZE disagree");
+    rt_log("RomFS index %s: SHA-256 ok, %llu files (%llu in the aux image), %zu bytes", path,
+           (unsigned long long)file_count, (unsigned long long)aux_rows, index_size);
+}
+
+// The main image: TOTK_ROMFS / the default RomFS folder's romfs.bin, or that path itself when it names a file (the
+// player's .nup container indexed in place).
+static void image_path(char *out, size_t cap) {
+    const char *dir = rt_config()->romfs;
+    if (plat_file_exists(dir)) {
+        need(snprintf(out, cap, "%s", dir) < (int)cap, "image path");
+        return;
+    }
+    need(snprintf(out, cap, "%s/romfs.bin", dir) < (int)cap, "image path");
+}
+
+// The aux image: TOTK_ROMFS_AUX, else romfs-aux.bin next to the main image, else next to romfs-index.bin.
+static void aux_path(char *out, size_t cap) {
+    const char *e = cfg_get("TOTK_ROMFS_AUX");
+    if (e && *e) {
+        need(snprintf(out, cap, "%s", e) < (int)cap, "aux path");
+        return;
+    }
+    char dir[2048];
+    snprintf(dir, sizeof dir, "%s", image_file);
+    char *sep = plat_last_sep(dir);
+    if (sep) *sep = 0;
+    else strcpy(dir, ".");
+    need(snprintf(out, cap, "%s/romfs-aux.bin", dir) < (int)cap, "aux path");
+    if (plat_file_exists(out)) return;
+    need(snprintf(out, cap, "%s/romfs-aux.bin", index_dir) < (int)cap, "aux path");
 }
 
 static void init_once(void *param) {
@@ -530,8 +599,7 @@ static void init_once(void *param) {
 #else
     double t0 = now_s();
     load_index();
-    const char *dir = rt_config()->romfs;
-    need(snprintf(image_file, sizeof image_file, "%s/romfs.bin", dir) < (int)sizeof image_file, "image path");
+    image_path(image_file, sizeof image_file);
     image = open_read(image_file);
     if (!image) rt_fatal("RomFS image %s missing; put romfs.bin into the romfs folder next to totk or set TOTK_ROMFS",
                          image_file);
@@ -541,6 +609,17 @@ static void init_once(void *param) {
         rt_fatal("RomFS image %s has %llu bytes, the index was built for %llu", image_file,
                  (unsigned long long)sz.size, (unsigned long long)ROMFS_IMAGE_SIZE);
     rt_log("RomFS image %s: size ok (%llu bytes)", image_file, (unsigned long long)ROMFS_IMAGE_SIZE);
+    if (ROMFS_AUX_SIZE) {
+        aux_path(aux_file, sizeof aux_file);
+        aux = open_read(aux_file);
+        if (!aux) rt_fatal("RomFS aux image %s missing (tools/nup_romfs_index.py writes romfs-aux.bin; set TOTK_ROMFS_AUX)",
+                           aux_file);
+        need(plat_file_id(aux, &sz), "aux image size");
+        if (sz.size != ROMFS_AUX_SIZE)
+            rt_fatal("RomFS aux image %s has %llu bytes, the index was built for %llu", aux_file,
+                     (unsigned long long)sz.size, (unsigned long long)ROMFS_AUX_SIZE);
+        rt_log("RomFS aux image %s: size ok (%llu bytes)", aux_file, (unsigned long long)ROMFS_AUX_SIZE);
+    }
     verify_image(index_dir);
     const char *mm = cfg_get("TOTK_ROMFS_MMAP");
     if (mm && strcmp(mm, "0")) {
@@ -578,12 +657,16 @@ uint64_t romfs_file_count(void) { return file_count; }
 const char *romfs_entry(uint64_t i, uint64_t *offset, uint64_t *size) {
     if (i >= file_count) return NULL;
     Entry e = entry(i);
-    if (offset) *offset = e.offset;
+    if (offset) *offset = e.offset & ~AUX_FLAG;
     if (size) *size = e.size;
     return entry_name(e);
 }
 
+int romfs_entry_aux(uint64_t i) { return i < file_count && (entry(i).offset & AUX_FLAG) != 0; }
+
 const char *romfs_image_path(void) { return image_file; }
+
+const char *romfs_aux_path(void) { return aux ? aux_file : NULL; }
 
 size_t romfs_overlay_count(void) { return noverlay; }
 
@@ -652,7 +735,9 @@ uint32_t romfs_open(uint64_t *out, const char *path, int mode) {
         static int prefetch = -1;
         if (prefetch < 0) prefetch = !(cfg_get("OOT_ROMFS_PREFETCH") && !strcmp(cfg_get("OOT_ROMFS_PREFETCH"), "0"));
         Entry e = entry(i);
-        if (prefetch && e.size <= (64u << 20)) plat_file_prefetch(image, e.offset, e.size);
+        uint64_t off;
+        PlatFile *src = source(e, &off);
+        if (prefetch && e.size <= (64u << 20)) plat_file_prefetch(src, off, e.size);
     }
     plat_mutex_lock(&lock);
     for (unsigned j = 1; j < NH; j++)
@@ -689,8 +774,7 @@ static int handle_source(uint64_t h, PlatFile **f, uint64_t *base, uint64_t *siz
         *size = entry(i - 1).size;
     } else {
         Entry e = entry(i - 1);
-        *f = image;
-        *base = e.offset;
+        *f = source(e, base);
         *size = e.size;
     }
     return 1;
@@ -734,7 +818,9 @@ void romfs_close(uint64_t h) {
     PlatFile *of = handle_file[j];
     if (!of && handles[j]) {   // read from the image: a copy for the next time
         Entry e = entry(handles[j] - 1);
-        romfs_cache_note(handles[j] - 1, e.offset, e.size);
+        uint64_t off;
+        PlatFile *src = source(e, &off);
+        romfs_cache_note(handles[j] - 1, src, off, e.size);
     }
     handles[j] = 0;
     handle_ovl[j] = 0;

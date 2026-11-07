@@ -73,6 +73,48 @@ build/oot111/dkb --selftest                                   # layout, dispatch
 
 The executable keeps the inherited name `build/oot111/dkb`.
 
+## Running from a .nup without unpacking
+
+The packed `romfs.bin` is a 24.4 GiB copy of data the `.nup` already holds: the container stores every RomFS file
+as one extent at a 16-aligned offset, 145,999 of them raw (23.25 GB) and 40,588 zstd-compressed (2.99 GB
+decompressed). `tools/nup_romfs_index.py` indexes the raw files in place and writes only the compressed ones out,
+decompressed, into `romfs-aux.bin`; the runtime reads the raw files straight from the `.nup`. The disk cost of the
+RomFS drops from 24.4 GiB to 2.8 GiB, which is what makes a handheld with a 15 GB-free disk possible.
+
+```sh
+.venv-py314/bin/python tools/nup_romfs_index.py "<game>.nup" --out build/extracted/oot111-nup \
+    --check 400 --extracted build/extracted/oot111-dump/romfs         # 2.8 GB aux + 25 GB hashed: ~45 s
+.venv/bin/python tools/build_game.py --version oot111 --gen generated/oot111 --out build/oot111-nup \
+    --expected tools/data/expected-oot111.json --exefs build/extracted/oot111/exefs \
+    --romfs build/extracted/oot111-nup --profile build/profile-oot111   # the same objects, a new index + romfs.c
+TOTK_ROMFS="<game>.nup" TOTK_ROMFS_AUX=build/extracted/oot111-nup/romfs-aux.bin build/oot111-nup/dkb --probe-fs
+```
+
+`--out` gets `index.json` (the `dkb_pack_romfs.py` shape plus `image`, the `.nup` path, and the aux image's size and
+SHA-256), `romfs-aux.bin`, and a `romfs.bin` symlink to the `.nup`, so the folder also serves as `TOTK_ROMFS` and as
+`build_game.py --romfs`. The index is `TOTKRFS2`: a row whose offset has bit 63 set lies in the aux image
+(`tools/romfs_index.py` `AUX`); `romfs_config.h` gains `ROMFS_AUX_SIZE` and `ROMFS_AUX_SHA256`, and a `TOTKRFS1`
+index from a packed `romfs.bin` still loads. At run time `TOTK_ROMFS` may name the `.nup` itself or a folder with
+`romfs.bin` (file or link); the aux image is `TOTK_ROMFS_AUX`, else `romfs-aux.bin` next to the main image, else
+next to `romfs-index.bin`. `TOTK_ROMFS_VERIFY=full` hashes the whole `.nup` (and the aux image every time, 3 GB);
+`--no-hash` at index time makes that mode refuse. `--check N` reads N files back through the written index, a
+quarter of them from the aux image, and compares them with the extracted tree: 499 files, all equal.
+
+Verified on Firebird (`build/oot111-nup/dkb`, `logs/nup-run2.log`): `--probe-fs` samples 64 files plus the largest
+(385.6 MiB) against the `.nup` at their index offsets, all equal; a 150 s run with the fake-button sequence
+`1@20,1@30,1@40,1@50,1@62` (title, Continue, the save, Load, confirm) reached Lon Lon Ranch, read 7.6 GB through
+20,760 positional reads (`OOT_FS_STATS=1`, slowest 20 ms), ended with `boot: passed`, 0 shader failures and peak
+RSS 8.2 GB; frame rates 52.9 / 46.4 fps mean over the two ranch minutes against 53.3 / 47.6 from the packed image.
+The three-press sequence in "Running" stops at the Load confirmation with a cold pipeline cache; five presses land.
+
+What a handheld needs on its disk with this scheme: the executable (302 MB), `romfs-aux.bin` (2.8 GB),
+`romfs-index.bin` (15 MB), `build/xlate/` (129 MB), the `exefs` (~80 MB) and the shader/pipeline caches it builds
+(85 MB + 5 MB here), about 3.4 GB beside the `.nup` the emulator already keeps.
+
+The `romfs cache` (`romfs_cache.c`) copies files from whichever image a row points into. `tools/shader_census.py`
+and other scripts that read `romfs.bin` by `index.json` offsets do not know aux rows yet; run them on the packed
+layout.
+
 ## Fix needed: fiber stack alignment
 
 Every run crashed about two seconds after the guest started, with or without a GPU, with SIGSEGV in a `guest`

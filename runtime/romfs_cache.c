@@ -26,10 +26,9 @@ enum { RING = 8192, COPY_CHUNK = 8u << 20 };
 
 static char dir[1024];
 static int on;
-static PlatFile *src;
 static uint64_t nfiles, budget, used, floor_free;
 static uint8_t *known;   // per file: 1 queued or copied
-static struct { uint64_t i, off, size; } ring[RING];
+static struct { uint64_t i, off, size; PlatFile *from; } ring[RING];   // from: the main or the aux image (romfs.c)
 static unsigned head, tail;
 static PlatMutex lock = PLAT_MUTEX_INIT;
 static PlatCond wake;
@@ -82,7 +81,7 @@ static int scan_cb(const char *name, int kind, uint64_t size, void *ctx) {
     return 1;
 }
 
-static void copy_one(uint64_t i, uint64_t off, uint64_t size, uint8_t *buf) {
+static void copy_one(uint64_t i, PlatFile *src, uint64_t off, uint64_t size, uint8_t *buf) {
     uint64_t freeb = plat_fs_free_bytes(dir);
     if (used + size > budget || (freeb != UINT64_MAX && freeb < floor_free + size)) return;
     char tmp[1200], fin[1200];
@@ -120,9 +119,10 @@ static void writer(void *arg) {
         plat_mutex_lock(&lock);
         while (head == tail) plat_cond_wait(&wake, &lock);
         uint64_t i = ring[tail % RING].i, off = ring[tail % RING].off, size = ring[tail % RING].size;
+        PlatFile *from = ring[tail % RING].from;
         tail++;
         plat_mutex_unlock(&lock);
-        copy_one(i, off, size, buf);
+        copy_one(i, from, off, size, buf);
     }
 }
 
@@ -181,7 +181,6 @@ void romfs_cache_init(PlatFile *image, uint64_t file_count) {
     const char *g = cfg_get("OOT_ROMFS_CACHE_GB"), *f = cfg_get("OOT_ROMFS_CACHE_FREE_GB");
     budget = (uint64_t)((g && *g ? atof(g) : 8.0) * 1e9);
     floor_free = (uint64_t)((f && *f ? atof(f) : 10.0) * 1e9);
-    src = image;
     plat_cond_init(&wake);
     if (!plat_thread_spawn(writer, NULL, "romfs-cache", 0)) return;
     on = 1;
@@ -203,12 +202,13 @@ PlatFile *romfs_cache_open(uint64_t i, uint64_t size) {
     return f;
 }
 
-void romfs_cache_note(uint64_t i, uint64_t off, uint64_t size) {
-    if (!on || i >= nfiles || !size) return;
+void romfs_cache_note(uint64_t i, PlatFile *from, uint64_t off, uint64_t size) {
+    if (!on || i >= nfiles || !size || !from) return;
     plat_mutex_lock(&lock);
     if (!known[i] && head - tail < RING) {
         known[i] = 1;
         ring[head % RING].i = i, ring[head % RING].off = off, ring[head % RING].size = size;
+        ring[head % RING].from = from;
         head++;
         plat_cond_signal(&wake);
     }
